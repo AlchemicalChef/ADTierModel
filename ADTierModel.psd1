@@ -2,9 +2,9 @@
     RootModule = 'ADTierModel.psm1'
     ModuleVersion = '1.0.0'
     GUID = 'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d'
-    Author = 'Enterprise Security Team'
-    CompanyName = 'Your Organization'
-    Copyright = '(c) 2025. All rights reserved.'
+    Author = 'AlchemicalChef'
+    CompanyName = 'ADSecurityInsight'
+    Copyright = 'Its an MIT License, go nuts'
     Description = 'Implements a comprehensive tiered administrative model for Active Directory environments with Tier 0 (Infrastructure), Tier 1 (Servers), and Tier 2 (Workstations) separation.'
     
     PowerShellVersion = '5.1'
@@ -62,8 +62,8 @@
     PrivateData = @{
         PSData = @{
             Tags = @('ActiveDirectory', 'Security', 'TierModel', 'Administration', 'ESAE')
-            ProjectUri = 'https://github.com/yourorg/ADTierModel'
-            LicenseUri = 'https://github.com/yourorg/ADTierModel/LICENSE'
+            ProjectUri = 'https://github.com/AlchemicalChef/ADSecure/'
+            LicenseUri = 'https://github.com/AlchemicalChef/ADSecure/'
             ReleaseNotes = 'Initial release of AD Tier Model implementation'
         }
     }
