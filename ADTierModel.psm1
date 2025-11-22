@@ -68,19 +68,23 @@ function Write-TierLog {
         
         [ValidateSet('Info', 'Warning', 'Error', 'Success')]
         [string]$Level = 'Info',
-        
+
         [string]$Component = 'General'
     )
-    
+
     $logPath = "$env:ProgramData\ADTierModel\Logs"
-    if (-not (Test-Path $logPath)) {
-        New-Item -Path $logPath -ItemType Directory -Force | Out-Null
-    }
-    
+    Ensure-TierDataDirectory -Path $logPath
+
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logFile = Join-Path $logPath "ADTierModel_$(Get-Date -Format 'yyyyMMdd').log"
-    $logEntry = "$timestamp [$Level] [$Component] $Message"
-    
+    $safeMessage = ($Message -replace '[\r\n]+', ' ').Trim()
+
+    if ($safeMessage.Length -gt 4000) {
+        $safeMessage = $safeMessage.Substring(0, 4000) + '...'
+    }
+
+    $logEntry = "$timestamp [$Level] [$Component] $safeMessage"
+
     Add-Content -Path $logFile -Value $logEntry
     
     switch ($Level) {
@@ -138,10 +142,12 @@ function Test-ADTierPrerequisites {
     
     # Check permissions (basic check)
     try {
-        $null = Get-ADUser -Identity $env:USERNAME -ErrorAction Stop
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $sidValue = $currentUser.User.Value
+        $null = Get-ADUser -Identity $sidValue -ErrorAction Stop
     }
     catch {
-        $issues += "Insufficient permissions to query Active Directory"
+        $issues += "Insufficient permissions to query Active Directory using the current identity"
     }
     
     if ($issues.Count -gt 0) {
@@ -389,10 +395,8 @@ function Initialize-ADTierModel {
         
         # Save configuration
         $configDir = Split-Path $script:ConfigPath -Parent
-        if (-not (Test-Path $configDir)) {
-            New-Item -Path $configDir -ItemType Directory -Force | Out-Null
-        }
-        
+        Ensure-TierDataDirectory -Path $configDir
+
         $config = @{
             InitializedDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
             DomainDN = $domainDN
@@ -400,7 +404,7 @@ function Initialize-ADTierModel {
             InitializationResults = $results
         }
         
-        $config | ConvertTo-Json -Depth 10 | Set-Content -Path $script:ConfigPath
+        $config | ConvertTo-Json -Depth 10 | Set-Content -Path $script:ConfigPath -Encoding UTF8
         Write-TierLog -Message "Configuration saved to $script:ConfigPath" -Level Success -Component 'Initialize'
     }
     
@@ -1134,30 +1138,35 @@ function Get-ADTierViolation {
         
         foreach ($tierKey in $script:TierConfiguration.Keys) {
             $adminGroup = Get-ADGroup -Filter "Name -eq '$tierKey-Admins'" -ErrorAction SilentlyContinue
-            
+
             if ($adminGroup) {
-                $members = Get-ADGroupMember -Identity $adminGroup -Recursive
-                
-                foreach ($member in $members) {
-                    $memberDN = (Get-ADObject -Identity $member.DistinguishedName).DistinguishedName
-                    
-                    # Check if member is from a different tier
-                    foreach ($otherTier in ($script:TierConfiguration.Keys | Where-Object { $_ -ne $tierKey })) {
-                        $otherTierOU = $script:TierConfiguration[$otherTier].OUPath
-                        
-                        if ($memberDN -like "*$otherTierOU*") {
-                            $violations += [PSCustomObject]@{
-                                ViolationType = 'CrossTierAccess'
-                                Severity = 'High'
-                                SourceTier = $otherTier
-                                TargetTier = $tierKey
-                                Identity = $member.Name
-                                Group = $adminGroup.Name
-                                Description = "User from $otherTier has access to $tierKey administrative group"
-                                DetectedDate = Get-Date
+                try {
+                    $members = Get-ADGroupMember -Identity $adminGroup -Recursive -ResultPageSize 200 -ResultSetSize 5000 -ErrorAction Stop
+
+                    foreach ($member in $members) {
+                        $memberDN = (Get-ADObject -Identity $member.DistinguishedName -ErrorAction Stop).DistinguishedName
+
+                        # Check if member is from a different tier
+                        foreach ($otherTier in ($script:TierConfiguration.Keys | Where-Object { $_ -ne $tierKey })) {
+                            $otherTierOU = $script:TierConfiguration[$otherTier].OUPath
+
+                            if ($memberDN -like "*$otherTierOU*") {
+                                $violations += [PSCustomObject]@{
+                                    ViolationType = 'CrossTierAccess'
+                                    Severity = 'High'
+                                    SourceTier = $otherTier
+                                    TargetTier = $tierKey
+                                    Identity = $member.Name
+                                    Group = $adminGroup.Name
+                                    Description = "User from $otherTier has access to $tierKey administrative group"
+                                    DetectedDate = Get-Date
+                                }
                             }
                         }
                     }
+                }
+                catch {
+                    Write-TierLog -Message "Failed to enumerate members of $($adminGroup.Name): $_" -Level Warning -Component 'Audit'
                 }
             }
         }
@@ -1191,6 +1200,43 @@ function Get-ADTierViolation {
     
     Write-TierLog -Message "Found $($violations.Count) tier violations" -Level $(if ($violations.Count -gt 0) { 'Warning' } else { 'Info' }) -Component 'Audit'
     return $violations
+}
+
+function Ensure-TierDataDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $programDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+
+    if (-not $programDataRoot -or ($fullPath -notlike "$programDataRoot*")) {
+        throw "Invalid storage path specified: $fullPath"
+    }
+
+    if (-not (Test-Path $fullPath)) {
+        New-Item -Path $fullPath -ItemType Directory -Force | Out-Null
+    }
+
+    try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $permissions = @(
+            New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators', 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'),
+            New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        )
+
+        foreach ($rule in $permissions) {
+            $acl.SetAccessRule($rule)
+        }
+
+        $acl.SetAccessRuleProtection($true, $false)
+        Set-Acl -Path $fullPath -AclObject $acl
+    }
+    catch {
+        Write-Warning "Unable to harden directory permissions for $fullPath: $_"
+    }
 }
 
 function Test-ADTierCompliance {
