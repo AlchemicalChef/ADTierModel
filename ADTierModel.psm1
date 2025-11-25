@@ -836,13 +836,13 @@ function Set-ADTierMember {
         Moves an AD object to the appropriate OU within a tier structure.
     
     .PARAMETER Identity
-        The AD object to move (user, computer, or group).
+        The AD object to move (user, computer, admin workstation, group, or service account).
     
     .PARAMETER TierName
         Target tier (Tier0, Tier1, or Tier2).
     
     .PARAMETER ObjectType
-        Type of object: User, Computer, or Group.
+        Type of object: User, Computer, AdminWorkstation, Group, or ServiceAccount.
     
     .EXAMPLE
         Set-ADTierMember -Identity "SRV-APP01" -TierName Tier1 -ObjectType Computer
@@ -857,7 +857,7 @@ function Set-ADTierMember {
         [string]$TierName,
         
         [Parameter(Mandatory)]
-        [ValidateSet('User', 'Computer', 'Group', 'ServiceAccount')]
+        [ValidateSet('User', 'Computer', 'AdminWorkstation', 'Group', 'ServiceAccount')]
         [string]$ObjectType
     )
     
@@ -868,6 +868,7 @@ function Set-ADTierMember {
         $targetOUMap = @{
             'User' = 'Users'
             'Computer' = 'Computers'
+            'AdminWorkstation' = 'AdminWorkstations'
             'Group' = 'Groups'
             'ServiceAccount' = 'ServiceAccounts'
         }
@@ -879,6 +880,7 @@ function Set-ADTierMember {
                 $adObject = switch ($ObjectType) {
                     'User' { Get-ADUser -Identity $Identity }
                     'Computer' { Get-ADComputer -Identity $Identity }
+                    'AdminWorkstation' { Get-ADComputer -Identity $Identity }
                     'Group' { Get-ADGroup -Identity $Identity }
                     'ServiceAccount' { Get-ADUser -Identity $Identity }
                 }
@@ -2691,16 +2693,42 @@ function Set-GPOUserRight {
         # Convert identity to SIDs
         $sids = @()
         foreach ($id in $Identity) {
-            try {
-                # Remove domain prefix if present
-                $accountName = $id -replace '^.*\\', ''
-                $account = Get-ADGroup -Filter "Name -eq '$accountName'" -ErrorAction Stop
-                if ($account) {
-                    $sids += "*$($account.SID)"
+            # Remove domain prefix if present
+            $accountName = $id -replace '^.*\\', ''
+            $account = $null
+
+            foreach ($resolver in @(
+                { Get-ADGroup -Identity $accountName -ErrorAction Stop },
+                { Get-ADUser -Identity $accountName -ErrorAction Stop },
+                { Get-ADObject -Identity $id -Properties objectSid -ErrorAction Stop }
+            )) {
+                try {
+                    $account = & $resolver
+                    break
+                }
+                catch {
+                    continue
                 }
             }
-            catch {
-                Write-Warning "Could not resolve identity: $id"
+
+            if (-not $account) {
+                try {
+                    $sid = New-Object System.Security.Principal.SecurityIdentifier($id)
+                    $sids += "*$sid"
+                    continue
+                }
+                catch {
+                    Write-Warning "Could not resolve identity: $id"
+                    continue
+                }
+            }
+
+            $sidValue = if ($account.PSObject.Properties['SID']) { $account.SID.Value } else { $account.objectSid.Value }
+            if ($sidValue) {
+                $sids += "*$sidValue"
+            }
+            else {
+                Write-Warning "Could not resolve SID for identity: $id"
             }
         }
         
