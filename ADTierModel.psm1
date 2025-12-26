@@ -2864,74 +2864,133 @@ function Set-ADTierLogonRestrictions {
     <#
     .SYNOPSIS
         Configures logon restrictions in GPO to enforce tier separation.
-    
+
     .DESCRIPTION
         Implements user rights assignments to prevent cross-tier authentication.
         Enforces the principle: credentials only flow downward, authentication never flows down.
-    
+
+        IMPORTANT: This function restricts BOTH custom tier groups AND built-in privileged
+        groups (Domain Admins, Enterprise Admins, Schema Admins, etc.) per Microsoft ESAE
+        best practices. Built-in Tier 0 groups must never authenticate to lower-tier systems.
+
     .PARAMETER TierName
         The tier to configure logon restrictions for.
-    
+
     .PARAMETER GPOName
         The name of the GPO to configure.
-    
+
+    .PARAMETER IncludeBuiltInGroups
+        Include built-in privileged groups (Domain Admins, Enterprise Admins, etc.) in
+        logon restrictions. Default is $true per Microsoft best practices.
+
     .EXAMPLE
         Set-ADTierLogonRestrictions -TierName Tier0 -GPOName "SEC-Tier0-LogonRestrictions"
-    
+
+    .EXAMPLE
+        Set-ADTierLogonRestrictions -TierName Tier2 -GPOName "SEC-Tier2-LogonRestrictions" -IncludeBuiltInGroups $true
+
     .NOTES
         This function enforces:
-        - Tier 0 accounts can ONLY log onto Tier 0 systems
-        - Tier 1 accounts can ONLY log onto Tier 1 and Tier 2 systems
+        - Tier 0 accounts (including Domain Admins, Enterprise Admins) can ONLY log onto Tier 0 systems
+        - Tier 1 accounts can ONLY log onto Tier 1 systems (not Tier 0 or Tier 2)
         - Tier 2 accounts can ONLY log onto Tier 2 systems
+
+        Built-in groups protected as Tier 0:
+        - Domain Admins, Enterprise Admins, Schema Admins
+        - Administrators (domain), Account Operators
+        - Backup Operators, Server Operators, Print Operators
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [ValidateSet('Tier0', 'Tier1', 'Tier2')]
         [string]$TierName,
-        
+
         [Parameter(Mandatory)]
-        [string]$GPOName
+        [string]$GPOName,
+
+        [bool]$IncludeBuiltInGroups = $true
     )
-    
+
     try {
         $domainDN = Get-ADDomainRootDN
         $domain = (Get-ADDomain).DNSRoot
-        
+        $netbiosDomain = (Get-ADDomain).NetBIOSName
+
         Write-Verbose "Configuring logon restrictions for $TierName in GPO: $GPOName"
-        
+
+        # Built-in Tier 0 privileged groups that must be protected
+        # These groups have domain-wide administrative privileges and are inherently Tier 0
+        $builtInTier0Groups = @(
+            "$netbiosDomain\Domain Admins",
+            "$netbiosDomain\Enterprise Admins",
+            "$netbiosDomain\Schema Admins",
+            "$netbiosDomain\Administrators",
+            "$netbiosDomain\Account Operators",
+            "$netbiosDomain\Backup Operators",
+            "$netbiosDomain\Server Operators",
+            "$netbiosDomain\Print Operators"
+        )
+
         # Define groups to restrict based on tier
         $restrictionConfig = switch ($TierName) {
             'Tier0' {
                 # Tier 0: Deny Tier 1 and Tier 2 admin accounts from logging on
+                # Built-in groups are allowed on Tier 0 (they belong here)
                 @{
-                    DenyInteractiveLogon = @("$domain\Tier1-Admins", "$domain\Tier2-Admins")
-                    DenyNetworkLogon = @("$domain\Tier1-Admins", "$domain\Tier2-Admins")
-                    DenyRemoteInteractiveLogon = @("$domain\Tier1-Admins", "$domain\Tier2-Admins")
-                    DenyBatchLogon = @("$domain\Tier1-Admins", "$domain\Tier2-Admins")
-                    DenyServiceLogon = @("$domain\Tier1-Admins", "$domain\Tier2-Admins")
+                    DenyInteractiveLogon = @("$netbiosDomain\Tier1-Admins", "$netbiosDomain\Tier2-Admins")
+                    DenyNetworkLogon = @("$netbiosDomain\Tier1-Admins", "$netbiosDomain\Tier2-Admins")
+                    DenyRemoteInteractiveLogon = @("$netbiosDomain\Tier1-Admins", "$netbiosDomain\Tier2-Admins")
+                    DenyBatchLogon = @("$netbiosDomain\Tier1-Admins", "$netbiosDomain\Tier2-Admins")
+                    DenyServiceLogon = @("$netbiosDomain\Tier1-Admins", "$netbiosDomain\Tier2-Admins")
                 }
             }
             'Tier1' {
-                # Tier 1: Deny Tier 0 accounts (downward auth) and Tier 2 accounts (lateral)
+                # Tier 1: Deny Tier 0 accounts (prevents credential exposure) and Tier 2 accounts (prevents lateral movement)
+                # Include built-in Tier 0 groups to prevent Domain Admins from logging onto servers
+                $tier0Groups = @("$netbiosDomain\Tier0-Admins")
+                $tier2Groups = @("$netbiosDomain\Tier2-Admins")
+
+                if ($IncludeBuiltInGroups) {
+                    $tier0Groups += $builtInTier0Groups
+                }
+
+                $denyGroups = $tier0Groups + $tier2Groups
+
                 @{
-                    DenyInteractiveLogon = @("$domain\Tier0-Admins", "$domain\Tier2-Admins")
-                    DenyNetworkLogon = @("$domain\Tier0-Admins", "$domain\Tier2-Admins")
-                    DenyRemoteInteractiveLogon = @("$domain\Tier0-Admins", "$domain\Tier2-Admins")
-                    DenyBatchLogon = @("$domain\Tier0-Admins", "$domain\Tier2-Admins")
-                    DenyServiceLogon = @("$domain\Tier0-Admins", "$domain\Tier2-Admins")
+                    DenyInteractiveLogon = $denyGroups
+                    DenyNetworkLogon = $denyGroups
+                    DenyRemoteInteractiveLogon = $denyGroups
+                    DenyBatchLogon = $denyGroups
+                    DenyServiceLogon = $denyGroups
                 }
             }
             'Tier2' {
-                # Tier 2: Deny Tier 0 and Tier 1 accounts (no downward auth)
+                # Tier 2: Deny ALL Tier 0 and Tier 1 accounts (no high-privilege credentials on workstations)
+                # Include built-in Tier 0 groups to prevent Domain Admins from logging onto workstations
+                $tier0Groups = @("$netbiosDomain\Tier0-Admins")
+                $tier1Groups = @("$netbiosDomain\Tier1-Admins")
+
+                if ($IncludeBuiltInGroups) {
+                    $tier0Groups += $builtInTier0Groups
+                }
+
+                $denyGroups = $tier0Groups + $tier1Groups
+
                 @{
-                    DenyInteractiveLogon = @("$domain\Tier0-Admins", "$domain\Tier1-Admins")
-                    DenyNetworkLogon = @("$domain\Tier0-Admins", "$domain\Tier1-Admins")
-                    DenyRemoteInteractiveLogon = @("$domain\Tier0-Admins", "$domain\Tier1-Admins")
-                    DenyBatchLogon = @("$domain\Tier0-Admins", "$domain\Tier1-Admins")
-                    DenyServiceLogon = @("$domain\Tier0-Admins", "$domain\Tier1-Admins")
+                    DenyInteractiveLogon = $denyGroups
+                    DenyNetworkLogon = $denyGroups
+                    DenyRemoteInteractiveLogon = $denyGroups
+                    DenyBatchLogon = $denyGroups
+                    DenyServiceLogon = $denyGroups
                 }
             }
+        }
+
+        # Log the groups being restricted
+        if ($IncludeBuiltInGroups -and $TierName -ne 'Tier0') {
+            Write-Verbose "Including built-in Tier 0 groups in restrictions: $($builtInTier0Groups -join ', ')"
+            Write-TierLog -Message "Configuring $TierName with built-in group restrictions (Domain Admins, Enterprise Admins, etc.)" -Level Info -Component 'GPO'
         }
         
         if ($PSCmdlet.ShouldProcess($GPOName, "Configure Logon Restrictions")) {
